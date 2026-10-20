@@ -686,12 +686,12 @@ mod tests {
         for artifact in artifacts {
             assert_eq!(artifact.view(), view);
             (journal, _, _) = journal
-                .append(view.get(), &artifact)
+                .append(actor::journal_section(view), &artifact)
                 .await
                 .expect("unable to append voter journal artifact");
         }
         journal
-            .sync(view.get())
+            .sync(actor::journal_section(view))
             .await
             .expect("unable to sync voter journal");
     }

@@ -52,6 +52,19 @@ use std::{
 };
 use tracing::{Instrument as _, Span, debug, info, info_span, trace, warn};
 
+/// Views journaled per section. Each section is a separate blob, and creating or removing one
+/// costs several directory syncs, so grouping views amortizes that cost across the section.
+const VIEWS_PER_SECTION: u64 = 64;
+
+/// Returns the journal section holding the artifacts of `view`.
+///
+/// Pruning below `journal_section(min_active)` only removes sections whose views are all
+/// below `min_active`, so the journal may retain up to `VIEWS_PER_SECTION - 1` older views.
+/// Replay treats them like artifacts left by a crash between finalization and pruning.
+pub(super) const fn journal_section(view: View) -> u64 {
+    view.get() / VIEWS_PER_SECTION
+}
+
 /// Messages built and recorded during an event loop iteration, staged for
 /// broadcast after the journal sync barrier (see [Actor::construct] and
 /// [Actor::notify]).
@@ -302,7 +315,7 @@ impl<
                 min = min_active.traced()
             );
             rebind(&mut self.journal, |journal| {
-                journal.prune(min_active.get()).instrument(span)
+                journal.prune(journal_section(min_active)).instrument(span)
             })
             .await
             .expect("unable to prune journal");
@@ -322,7 +335,7 @@ impl<
         if self.journal.is_some() {
             let view = artifact.view();
             rebind(&mut self.journal, |journal| {
-                journal.append(view.get(), &artifact)
+                journal.append(journal_section(view), &artifact)
             })
             .await
             .expect("unable to append to journal");
@@ -354,7 +367,7 @@ impl<
             view = view.traced()
         );
         rebind(&mut self.journal, |journal| {
-            journal.sync(view.get()).instrument(span)
+            journal.sync(journal_section(view)).instrument(span)
         })
         .await
         .expect("unable to sync journal");
