@@ -3271,43 +3271,53 @@ mod tests {
 
     #[test_traced]
     fn test_framed_values_drop_index_entries_ahead_of_values() {
-        deterministic::Runner::default().start(|context| async move {
-            for garbage in [false, true] {
-                let cfg = test_config(&context, &format!("ahead-{garbage}"), NZU64!(64), FourCap);
-                let archive = Archive::init(context.child("seed"), cfg.clone()).await.unwrap();
-                let archive = put_items(archive, 0..3).await;
+        use crate::journal::segmented::oversized::MAX_INDEX_TAIL_RECORDS;
+        use commonware_runtime::{
+            deterministic::{FaultConfig, PartialWriteMode, WriteConfig},
+            mocks::SyncFaultContext,
+        };
+        use commonware_utils::Probability;
 
-                // An empty sync leaves no section active, so it also syncs the index.
-                let archive = archive.sync().await.unwrap();
-                archive.sync().await.unwrap();
-                assert!(partition_bytes(&context, &cfg.key_partition).await > 0);
-
-                // Model an index that became durable ahead of its last value.
-                if garbage {
-                    corrupt_frame(&context, &cfg.value_partition, &0u64.to_be_bytes(), 2, I32_VALUE_FRAME_SIZE).await;
-                } else {
-                    let (blob, len) = context
-                        .open(&cfg.value_partition, &0u64.to_be_bytes())
-                        .await
-                        .unwrap();
-                    blob.resize(len - I32_VALUE_FRAME_SIZE / 2).await.unwrap();
-                    blob.sync().await.unwrap();
-                }
-
-                for attempt in 0..2 {
-                    let archive = Archive::<_, _, FixedBytes<64>, i32>::init(
-                        context.child("reopen"),
-                        cfg.clone(),
-                    )
-                    .await
-                    .unwrap();
-                    assert_items(&archive, 0..3, 0..2).await;
-                    if attempt == 1 {
-                        archive.destroy().await.unwrap();
+        // Unsynced value bytes are lost (short values) or partially retained (garbage values).
+        for garbage in [false, true] {
+            let (_, checkpoint) =
+                deterministic::Runner::default().start_and_recover(move |context| async move {
+                    if garbage {
+                        *context.storage_fault_config().write() = FaultConfig {
+                            write_rate: Some(WriteConfig {
+                                failure_rate: Probability::new(0, 1).unwrap(),
+                                retention_rate: Probability::new(1, 2).unwrap(),
+                                mode: PartialWriteMode::Subset,
+                            }),
+                            ..Default::default()
+                        };
                     }
+                    let cfg = test_config(&context, "ahead", NZU64!(1024), FourCap);
+                    let faulty = SyncFaultContext {
+                        inner: context.child("first"),
+                        fail_partition: cfg.value_partition.clone(),
+                    };
+                    let archive = Archive::init(faulty, cfg).await.unwrap();
+
+                    // A full index tail makes this sync persist the index together with its
+                    // values, whose sync fails.
+                    let archive = put_items(archive, 0..MAX_INDEX_TAIL_RECORDS).await;
+                    assert!(archive.sync().await.is_err());
+                });
+
+            deterministic::Runner::from(checkpoint).start(|context| async move {
+                *context.storage_fault_config().write() = FaultConfig::default();
+                let cfg = test_config(&context, "ahead", NZU64!(1024), FourCap);
+                assert!(partition_bytes(&context, &cfg.key_partition).await > 0);
+                for _ in 0..2 {
+                    let archive =
+                        Archive::<_, _, FixedBytes<64>, i32>::init(context.child("reopen"), cfg.clone())
+                            .await
+                            .unwrap();
+                    assert_items(&archive, 0..MAX_INDEX_TAIL_RECORDS, 0..0).await;
                 }
-            }
-        });
+            });
+        }
     }
 
     #[test_traced]
@@ -3371,7 +3381,7 @@ mod tests {
             let archive = Archive::init(context.child("seed"), cfg.clone()).await.unwrap();
             let archive = put_items(archive, 0..4).await;
             let archive = archive.sync().await.unwrap();
-            let archive = archive.sync().await.unwrap();
+            archive.sync().await.unwrap();
 
             // Keep the pruned section's durable index bytes, then restore them after the prune
             // completes: the image of a prune interrupted after its markers and values were
@@ -3380,6 +3390,9 @@ mod tests {
             assert!(len > 0, "section 0 index must be durable before the prune");
             let index_bytes = blob.read_at(0, len as usize, ReadOptions::default()).await.unwrap().coalesce();
             drop(blob);
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(context.child("prune"), cfg.clone())
+                .await
+                .unwrap();
             archive.prune(2).await.unwrap();
             let (blob, _) = context.open(&cfg.key_partition, &0u64.to_be_bytes()).await.unwrap();
             blob.write_at(0, index_bytes.as_ref().to_vec(), WriteOptions::SYNC).await.unwrap();
