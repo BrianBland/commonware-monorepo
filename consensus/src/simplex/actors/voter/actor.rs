@@ -46,6 +46,7 @@ use core::{
 };
 use rand_core::CryptoRng;
 use std::{
+    collections::BTreeSet,
     num::NonZeroUsize,
     pin::Pin,
     task::{self, Poll},
@@ -77,6 +78,13 @@ struct Staged<S: Scheme<D>, D: Digest> {
     nullification: Option<Nullification<S>>,
     finalize: Option<Finalize<S, D>>,
     finalization: Option<Finalization<S, D>>,
+}
+
+impl<S: Scheme<D>, D: Digest> Staged<S, D> {
+    /// Whether this iteration publishes a local vote.
+    const fn has_vote(&self) -> bool {
+        self.nullify.is_some() || self.notarize.is_some() || self.finalize.is_some()
+    }
 }
 
 /// An outstanding request to the automaton.
@@ -179,7 +187,8 @@ pub struct Actor<
     write_buffer: NonZeroUsize,
     page_cache: CacheRef,
     journal: Option<Journal<E, Artifact<S, D>>>,
-    dirty_section: Option<View>,
+    /// Journal sections with appends not yet synced.
+    dirty_sections: BTreeSet<u64>,
 
     mailbox_receiver: mailbox::Receiver<Message<S, D>>,
 
@@ -266,7 +275,7 @@ impl<
                 write_buffer: cfg.write_buffer,
                 page_cache: cfg.page_cache,
                 journal: None,
-                dirty_section: None,
+                dirty_sections: BTreeSet::new(),
 
                 mailbox_receiver,
 
@@ -320,14 +329,15 @@ impl<
             .await
             .expect("unable to prune journal");
         }
+        let floor = journal_section(min_active);
+        self.dirty_sections.retain(|section| *section >= floor);
         self
     }
 
     /// Appends a verified message to the journal.
     ///
-    /// The append is not immediately durable. All appends in an event loop
-    /// iteration target the view being processed and are synced together by
-    /// [Self::sync_journal].
+    /// The append is not immediately durable: it becomes durable at the next
+    /// [Self::sync_journal], which runs before any local vote is published.
     ///
     /// Inert until replay attaches the journal, so handlers called during
     /// replay do not re-journal the artifacts they restore.
@@ -339,39 +349,32 @@ impl<
             })
             .await
             .expect("unable to append to journal");
-            match self.dirty_section {
-                Some(dirty) => assert_eq!(
-                    dirty, view,
-                    "one voter iteration must append to a single journal section"
-                ),
-                None => self.dirty_section = Some(view),
-            }
+            self.dirty_sections.insert(journal_section(view));
         }
         self
     }
 
-    /// Syncs the journal section written by this iteration, if any.
+    /// Syncs every journal section with pending appends, oldest first.
     ///
-    /// Called after construction and before publication so every appended artifact
-    /// is durable by the end of the iteration. Proposal builds may start before
-    /// this sync, but the voter consumes their responses and dispatches child
-    /// certification only in the next iteration, so a durable child certification
-    /// implies its parent anchor is durable. A single sync coalesces all appends.
+    /// Runs before any local vote is published and whenever the voter enters a new
+    /// view, so a durable vote or view implies every artifact appended before it is
+    /// durable (in particular, a child's vote or certification implies its parent
+    /// anchor). Certificates and certification results for views already left wait
+    /// for the next sync: losing them to a crash only costs refetching or
+    /// re-certifying them.
     async fn sync_journal(mut self) -> Self {
-        let Some(view) = self.dirty_section else {
-            return self;
-        };
-        let span = info_span!(
-            "simplex.voter.journal.sync",
-            epoch = self.state.epoch().traced(),
-            view = view.traced()
-        );
-        rebind(&mut self.journal, |journal| {
-            journal.sync(journal_section(view)).instrument(span)
-        })
-        .await
-        .expect("unable to sync journal");
-        self.dirty_section = None;
+        for section in std::mem::take(&mut self.dirty_sections) {
+            let span = info_span!(
+                "simplex.voter.journal.sync",
+                epoch = self.state.epoch().traced(),
+                section
+            );
+            rebind(&mut self.journal, |journal| {
+                journal.sync(section).instrument(span)
+            })
+            .await
+            .expect("unable to sync journal");
+        }
         self
     }
 
@@ -1002,8 +1005,8 @@ impl<
         staged: Staged<S, D>,
     ) {
         assert!(
-            self.dirty_section.is_none(),
-            "journal must be synced before broadcast"
+            !staged.has_vote() || self.dirty_sections.is_empty(),
+            "journal must be synced before publishing a vote"
         );
 
         if let Some((certified, notarization)) = staged.certification {
@@ -1464,12 +1467,16 @@ impl<
                         &mut pending_verify,
                     ).await;
 
-                    // Sync everything appended this iteration (during message
-                    // processing and construction) in a single coalesced sync.
-                    // This runs even if there is nothing to broadcast (e.g. a
-                    // certification result was recorded) so every artifact is
-                    // durable by the end of the iteration that appended it.
-                    self = self.sync_journal().await;
+                    // A local vote must be durable before it is published, and its
+                    // sync covers every earlier append. Entering a new view is also
+                    // made durable, so replay resumes from the view we may have acted
+                    // in (for example, one where we may already have proposed).
+                    // Iterations that only record certificates or certification
+                    // results for views we already left skip the sync; those appends
+                    // become durable with the next vote or view entry.
+                    if staged.has_vote() || self.state.current_view() > start {
+                        self = self.sync_journal().await;
+                    }
 
                     // Broadcast everything we built (and report it to the application).
                     self.notify(
