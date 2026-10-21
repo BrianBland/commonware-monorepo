@@ -34,6 +34,8 @@ const IOVEC_BATCH_SIZE: usize = 1024;
 
 #[cfg(target_os = "linux")]
 mod aio;
+#[cfg(target_os = "linux")]
+mod group;
 
 /// Page-cache policy for one positioned I/O request.
 enum Cache {
@@ -168,7 +170,7 @@ impl Shared {
         // Other platforms retain `sync_all` for their platform-specific guarantees.
         cfg_if! {
             if #[cfg(target_os = "linux")] {
-                let result = self.file.sync_data();
+                let result = if group::enabled() { group::barrier(self) } else { self.file.sync_data() };
             } else {
                 let result = self.file.sync_all();
             }
@@ -605,7 +607,7 @@ impl crate::Blob for Blob {
         // Other SYNC writes finish with a full-file flush.
         cfg_if! {
             if #[cfg(target_os = "linux")] {
-                let flags = (sync && bufs.chunk_count() <= IOVEC_BATCH_SIZE)
+                let flags = (sync && !group::enabled() && bufs.chunk_count() <= IOVEC_BATCH_SIZE)
                     .then_some(libc::RWF_DSYNC);
             } else {
                 let flags = None;
