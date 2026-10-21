@@ -676,6 +676,7 @@ impl<E: Context, K: Array, V: CodecShared> Inner<E, K, V> {
             replay_buffer: config.table_replay_buffer,
             compression: config.value_compression,
             codec_config: config.codec_config,
+            framed_values: false,
         };
         let oversized_context = context.child("oversized");
         let oversized: Oversized<E, Record<K>, V> = match checkpoint

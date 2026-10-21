@@ -334,6 +334,7 @@ impl<const COMPRESSED: bool> StorageWorkload for SegmentedOversizedWorkload<COMP
             replay_buffer: REPLAY_BUFFER,
             compression: COMPRESSED.then_some(3),
             codec_config: (RangeCfg::new(0..256), ()),
+            framed_values: false,
         };
         let mut journal =
             oversized::Oversized::<_, TestEntry, Vec<u8>>::init(context.child("journal"), config)

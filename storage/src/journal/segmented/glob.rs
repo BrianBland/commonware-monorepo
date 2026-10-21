@@ -18,6 +18,23 @@
 //! - **Compressed Data**: zstd compressed (if enabled) or raw codec output
 //! - **CRC32**: 4-byte checksum of the compressed data
 //!
+//! # Self-Delimiting Records
+//!
+//! A glob opened for paired recovery may instead store self-delimiting records that carry a
+//! fixed-size caller header (the paired index entry) ahead of the data:
+//!
+//! ```text
+//! +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+//! |  Size (u32)   |  Header (fixed)  |  Compressed Data  |  CRC32  |
+//! +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+//! ```
+//!
+//! - **Size**: big-endian length of the whole record, including itself and the CRC32
+//! - **CRC32**: checksum of every preceding byte of the record
+//!
+//! Such a section can be scanned forward without its index: the scan stops at the first record
+//! that is shorter than its fixed parts, overruns the section, or fails its checksum.
+//!
 //! # Read Flow
 //!
 //! 1. Get `(offset, size)` from index entry
@@ -42,6 +59,12 @@ use zstd::zstd_safe::compress_bound;
 
 /// Physical overhead appended to every frame: the CRC32 of the frame's data.
 pub(crate) const CHECKSUM_SIZE: usize = crc32::Digest::SIZE;
+
+/// Length of the size field that begins every self-delimiting record.
+const RECORD_SIZE_LEN: usize = u32::SIZE;
+
+/// A self-delimiting record found by a forward scan: its offset, total size, and caller header.
+pub(crate) type ScannedRecord = (u64, u32, Vec<u8>);
 
 /// Configuration for blob storage.
 #[derive(Clone)]
@@ -71,11 +94,19 @@ struct Inner<E: Context, V: Codec> {
 
     /// Codec configuration.
     codec_config: V::Cfg,
+
+    /// Caller header length of self-delimiting records, or `None` for plain frames.
+    record_header: Option<usize>,
 }
 
 impl<E: Context, V: CodecShared> Inner<E, V> {
     /// See [Glob::init].
-    async fn init(context: E, cfg: Config<V::Cfg>, ceiling: u64) -> Result<Self, Error> {
+    async fn init(
+        context: E,
+        cfg: Config<V::Cfg>,
+        ceiling: u64,
+        record_header: Option<usize>,
+    ) -> Result<Self, Error> {
         let manager_cfg = ManagerConfig {
             partition: cfg.partition,
             factory: WriteFactory {
@@ -89,34 +120,51 @@ impl<E: Context, V: CodecShared> Inner<E, V> {
             manager,
             compression: cfg.compression,
             codec_config: cfg.codec_config,
+            record_header,
         })
     }
 
-    /// See [Glob::append].
-    async fn append(&mut self, section: u64, value: &V) -> Result<(u64, u32), Error> {
-        // Encode and optionally compress, then append checksum
-        let buf = if let Some(level) = self.compression {
-            // Compressed: encode first, then compress, then append checksum
+    /// Bytes preceding the data in every stored frame.
+    fn data_start(&self) -> usize {
+        self.record_header
+            .map_or(0, |header| RECORD_SIZE_LEN + header)
+    }
+
+    /// See [Glob::append] and [Glob::append_record]. `header` fills a self-delimiting record's
+    /// caller header once the record's offset and size are known.
+    async fn append(
+        &mut self,
+        section: u64,
+        value: &V,
+        header: impl FnOnce(u64, u32, &mut [u8]),
+    ) -> Result<(u64, u32), Error> {
+        // Reserve the record prefix so the data is encoded in place.
+        let data_start = self.data_start();
+        let mut buf = if let Some(level) = self.compression {
             let encoded = value.encode();
-            let mut compressed = Vec::with_capacity(compress_bound(encoded.len()) + CHECKSUM_SIZE);
-            frame::compress_into(level, &encoded, &mut compressed)?;
-            let checksum = Crc32::checksum(&compressed);
-            compressed.put_u32(checksum);
-            compressed
+            let mut buf =
+                Vec::with_capacity(data_start + compress_bound(encoded.len()) + CHECKSUM_SIZE);
+            buf.resize(data_start, 0);
+            frame::compress_into(level, &encoded, &mut buf)?;
+            buf
         } else {
-            // Uncompressed: pre-allocate exact size to avoid copying
-            let entry_size = value.encode_size() + CHECKSUM_SIZE;
-            let mut buf = Vec::with_capacity(entry_size);
+            let mut buf = Vec::with_capacity(data_start + value.encode_size() + CHECKSUM_SIZE);
+            buf.resize(data_start, 0);
             value.write(&mut buf);
-            let checksum = Crc32::checksum(&buf);
-            buf.put_u32(checksum);
             buf
         };
+        let entry_size =
+            u32::try_from(buf.len() + CHECKSUM_SIZE).map_err(|_| Error::ValueTooLarge)?;
 
         // Write to blob, taking the writer only when the entry does not fit in its buffer
-        let entry_size = u32::try_from(buf.len()).map_err(|_| Error::ValueTooLarge)?;
         let writer = self.manager.get_or_create(section).await?;
         let offset = writer.size();
+        if data_start > 0 {
+            buf[..RECORD_SIZE_LEN].copy_from_slice(&entry_size.to_be_bytes());
+            header(offset, entry_size, &mut buf[RECORD_SIZE_LEN..data_start]);
+        }
+        let checksum = Crc32::checksum(&buf);
+        buf.put_u32(checksum);
         if !writer.try_write_at(offset, &buf) {
             // Return the writer to the manager only after the owned write succeeds.
             let writer = self.manager.take(section).await?;
@@ -137,13 +185,13 @@ impl<E: Context, V: CodecShared> Inner<E, V> {
         // Read via buffered writer (handles read-through for buffered data)
         let buf = writer.read_at(offset, size as usize).await?.coalesce();
 
-        // Entry format: [compressed_data] [crc32 (4 bytes)]
-        if buf.len() < CHECKSUM_SIZE {
+        // Entry format: [record prefix] [compressed_data] [crc32 (4 bytes)]
+        let data_start = self.data_start();
+        if buf.len() < data_start + CHECKSUM_SIZE {
             return Err(Error::Runtime(RError::BlobInsufficientLength));
         }
 
         let data_len = buf.len() - CHECKSUM_SIZE;
-        let compressed_data = &buf.as_ref()[..data_len];
         let stored_checksum = u32::from_be_bytes(
             buf.as_ref()[data_len..]
                 .try_into()
@@ -151,18 +199,18 @@ impl<E: Context, V: CodecShared> Inner<E, V> {
         );
 
         // Verify checksum
-        let checksum = Crc32::checksum(compressed_data);
+        let checksum = Crc32::checksum(&buf.as_ref()[..data_len]);
         if checksum != stored_checksum {
             return Err(Error::ChecksumMismatch(stored_checksum, checksum));
         }
 
         // Decompress if needed and decode
         let value = if self.compression.is_some() {
-            let decompressed = frame::decompress(compressed_data)?;
+            let decompressed = frame::decompress(&buf.as_ref()[data_start..data_len])?;
             V::decode_cfg(decompressed, &self.codec_config).map_err(Error::Codec)?
         } else {
             // Share one Bytes owner instead of boxing the pooled IoBuf owner for every field
-            V::decode_cfg(Bytes::from(buf.slice(..data_len)), &self.codec_config)
+            V::decode_cfg(Bytes::from(buf.slice(data_start..data_len)), &self.codec_config)
                 .map_err(Error::Codec)?
         };
 
@@ -191,6 +239,42 @@ impl<E: Context, V: CodecShared> Inner<E, V> {
                 .expect("checksum is 4 bytes"),
         );
         Ok(Crc32::checksum(&buf.as_ref()[..data_len]) == stored_checksum)
+    }
+
+    /// See [Recovery::scan].
+    async fn scan(&self, section: u64, start: u64) -> Result<(Vec<ScannedRecord>, u64), Error> {
+        let data_start = self.data_start();
+        assert!(data_start > 0, "only self-delimiting records can be scanned");
+        let Some(writer) = self.manager.get(section)? else {
+            return Ok((Vec::new(), start));
+        };
+        let size = writer.size();
+        let minimum = (data_start + CHECKSUM_SIZE) as u64;
+        let mut records = Vec::new();
+        let mut offset = start;
+        while size.saturating_sub(offset) >= minimum {
+            let prefix = writer.read_at(offset, RECORD_SIZE_LEN).await?.coalesce();
+            let record_size =
+                u32::from_be_bytes(prefix.as_ref().try_into().expect("size field is 4 bytes"));
+            let extent = u64::from(record_size);
+            if extent < minimum || extent > size - offset {
+                break;
+            }
+            let record = writer.read_at(offset, record_size as usize).await?.coalesce();
+            let data_len = record.len() - CHECKSUM_SIZE;
+            let stored_checksum = u32::from_be_bytes(
+                record.as_ref()[data_len..]
+                    .try_into()
+                    .expect("checksum is 4 bytes"),
+            );
+            if Crc32::checksum(&record.as_ref()[..data_len]) != stored_checksum {
+                break;
+            }
+            let header = record.as_ref()[RECORD_SIZE_LEN..data_start].to_vec();
+            records.push((offset, record_size, header));
+            offset += extent;
+        }
+        Ok((records, offset))
     }
 
     /// See [Glob::inject].
@@ -303,7 +387,7 @@ impl<E: Context, V: CodecShared> std::fmt::Debug for Glob<E, V> {
 impl<E: Context, V: CodecShared> Glob<E, V> {
     /// Initialize blob storage, opening existing section blobs.
     pub async fn init(context: E, cfg: Config<V::Cfg>) -> Result<Self, Error> {
-        Ok(Recovery::init(context, cfg, u64::MAX).await?.into())
+        Ok(Recovery::init(context, cfg, u64::MAX, None).await?.into())
     }
 
     /// Append value to section.
@@ -312,7 +396,19 @@ impl<E: Context, V: CodecShared> Glob<E, V> {
     /// The returned size is the total bytes written (compressed_data + crc32).
     /// Both should be stored in the index entry for later retrieval.
     pub async fn append(mut self, section: u64, value: &V) -> Result<(Self, u64, u32), Error> {
-        let (offset, size) = self.0.append(section, value).await?;
+        let (offset, size) = self.0.append(section, value, |_, _, _| {}).await?;
+        Ok((self, offset, size))
+    }
+
+    /// Append a self-delimiting record to section, filling its caller header from the record's
+    /// offset and size once they are known.
+    pub(crate) async fn append_record(
+        mut self,
+        section: u64,
+        value: &V,
+        header: impl FnOnce(u64, u32, &mut [u8]),
+    ) -> Result<(Self, u64, u32), Error> {
+        let (offset, size) = self.0.append(section, value, header).await?;
         Ok((self, offset, size))
     }
 
@@ -421,8 +517,34 @@ impl<E: Context, V: CodecShared> From<Recovery<E, V>> for Glob<E, V> {
 impl<E: Context, V: CodecShared> Recovery<E, V> {
     /// Open value sections through `ceiling` under paired initialization ownership. Later sections
     /// stay closed until paired recovery removes them.
-    pub(crate) async fn init(context: E, cfg: Config<V::Cfg>, ceiling: u64) -> Result<Self, Error> {
-        Ok(Self(Box::new(Inner::init(context, cfg, ceiling).await?)))
+    ///
+    /// `record_header` selects self-delimiting records carrying a caller header of that length.
+    pub(crate) async fn init(
+        context: E,
+        cfg: Config<V::Cfg>,
+        ceiling: u64,
+        record_header: Option<usize>,
+    ) -> Result<Self, Error> {
+        Ok(Self(Box::new(
+            Inner::init(context, cfg, ceiling, record_header).await?,
+        )))
+    }
+
+    /// Whether values are stored as self-delimiting records.
+    pub(crate) const fn self_delimiting(&self) -> bool {
+        self.0.record_header.is_some()
+    }
+
+    /// Read the self-delimiting records of `section` from byte `start`, stopping at the first
+    /// record that is shorter than its fixed parts, overruns the section, or fails its checksum.
+    ///
+    /// Returns the records read and the end of the last one (`start` when none is valid).
+    pub(crate) async fn scan(
+        &self,
+        section: u64,
+        start: u64,
+    ) -> Result<(Vec<ScannedRecord>, u64), Error> {
+        self.0.scan(section, start).await
     }
 
     /// Check whether the entry at `(offset, size)` in `section` has a valid trailing checksum.
@@ -545,7 +667,7 @@ mod tests {
                 codec_config: self.0.codec_config.clone(),
             };
             _ = self.sync_all().await?;
-            let pending = Recovery::init(context, cfg, u64::MAX).await?;
+            let pending = Recovery::init(context, cfg, u64::MAX, None).await?;
             let pending = pending.truncate_section(section, end).await?;
             Ok(pending.into())
         }

@@ -156,6 +156,7 @@ fn config(pooler: &impl BufferPooler) -> Config<()> {
         replay_buffer: NZUsize!(4096),
         compression: None,
         codec_config: (),
+        framed_values: false,
     }
 }
 

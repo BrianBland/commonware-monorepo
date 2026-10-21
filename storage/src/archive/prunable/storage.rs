@@ -380,6 +380,7 @@ impl<T: Translator, E: Context, K: Array, V: CodecShared> Inner<T, E, K, V> {
             replay_buffer: cfg.replay_buffer,
             compression: cfg.compression,
             codec_config: cfg.codec_config,
+            framed_values: true,
         };
         let mut replay = Oversized::<E, Record<K>, V>::init_with_metadata(
             context.child("oversized"),

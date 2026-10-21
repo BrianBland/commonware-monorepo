@@ -54,6 +54,35 @@
 //! adopted once their index/value boundary is proven, entries above it are value-verified in
 //! order, and the first invalid value truncates the section's remainder. Markers trail proven
 //! syncs, publishing once a section is durable and idle (or on an empty flush).
+//!
+//! # Framed Values
+//!
+//! With [Config::framed_values], each value is stored as a self-delimiting, checksummed glob
+//! record that also carries its complete index entry (see [super::glob]). The value journal then
+//! acts as a write-ahead log and the index journal as a lazily persisted cache of it. The mode
+//! requires tracked initialization ([Oversized::init_with_metadata] or
+//! [Oversized::init_with_metadata_at_most]) and applies to fresh partitions only: the two formats
+//! are not distinguishable on disk, so a partition must never be reopened with the other setting.
+//!
+//! **Sync.** A sync makes the requested value sections durable. It also syncs, jointly with their
+//! values, the index of every section that has unsynced index entries and is not being written
+//! (absent from the sync's active set), and the index of every such section once the unsynced
+//! index tail across all sections reaches [MAX_INDEX_TAIL_RECORDS] records or
+//! [MAX_INDEX_TAIL_BYTES] value bytes. Only those joint syncs record marker barriers, so a
+//! published marker never covers an index entry that is not durable.
+//!
+//! **Recovery.** Tracked replay first drops index entries ahead of their values, as above. Once
+//! the index is exhausted, each value section is scanned forward from the end of its last indexed
+//! value. Scanning stops at the first record that is short, overruns the section, fails its
+//! checksum, fails to decode, or carries a location other than its own. The value section is
+//! durably truncated to the end of the last accepted record, every accepted record's entry is
+//! appended to the index in scan order, and the appended index sections are synced before any
+//! marker rises to cover them. The replay yields the rebuilt entries after the replayed ones, so
+//! a caller observes every retained entry in journal order. A value section left without any
+//! entry is removed; it is not an orphan while it holds valid records.
+//!
+//! **Prune.** Markers are removed durably first, then value sections, then index sections, so an
+//! interrupted prune leaves only index entries whose values are gone, which recovery truncates.
 
 use super::{
     fixed::{
@@ -66,12 +95,12 @@ use crate::{
     journal::{Error, durability::Barrier},
     metadata::{Config as MetadataConfig, Metadata},
 };
-use commonware_codec::{Codec, CodecFixed, CodecShared};
+use commonware_codec::{Codec, CodecFixed, CodecShared, DecodeExt as _};
 use commonware_runtime::{Error as RError, Handle, ReadOptions};
 use commonware_utils::sequence::U64 as SectionKey;
 use futures::{FutureExt as _, future::try_join};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     num::NonZeroUsize,
 };
 use tracing::{debug, warn};
@@ -119,6 +148,54 @@ pub struct Config<C> {
 
     /// Codec configuration for values.
     pub codec_config: C,
+
+    /// Store values as self-delimiting records carrying their index entries, so ordinary syncs
+    /// make only values durable (see [Framed Values](self#framed-values)).
+    ///
+    /// Requires tracked initialization and a partition never opened with the other setting.
+    pub framed_values: bool,
+}
+
+/// Unsynced index records, across all sections, at which a framed journal's sync also syncs
+/// every dirty index section.
+pub const MAX_INDEX_TAIL_RECORDS: u64 = 256;
+
+/// Value bytes referenced by unsynced index records, across all sections, at which a framed
+/// journal's sync also syncs every dirty index section.
+pub const MAX_INDEX_TAIL_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Index entries of a framed journal that are recoverable from value records but not yet synced.
+#[derive(Default)]
+struct IndexTail {
+    /// Unsynced `(records, value bytes)` per index section.
+    sections: BTreeMap<u64, (u64, u64)>,
+}
+
+impl IndexTail {
+    fn append(&mut self, section: u64, value_size: u32) {
+        let (records, bytes) = self.sections.entry(section).or_default();
+        *records += 1;
+        *bytes += u64::from(value_size);
+    }
+
+    /// Remove and return the sections whose index the next sync must persist: every dirty section
+    /// once the tail reaches its bound, otherwise those no longer being written.
+    fn take_checkpoint(&mut self, active: &BTreeSet<u64>) -> BTreeSet<u64> {
+        let (records, bytes) = self
+            .sections
+            .values()
+            .fold((0, 0), |(r, b), (records, bytes)| (r + records, b + bytes));
+        let bounded = records >= MAX_INDEX_TAIL_RECORDS || bytes >= MAX_INDEX_TAIL_BYTES;
+        let targets = self
+            .sections
+            .keys()
+            .copied()
+            .filter(|section| bounded || !active.contains(section))
+            .collect::<BTreeSet<_>>();
+        self.sections
+            .retain(|section, _| !targets.contains(section));
+        targets
+    }
 }
 
 /// Recovery contract applied while opening the index and value journals.
@@ -257,6 +334,9 @@ pub struct Oversized<E: Context, I: Record, V: Codec> {
     index: FixedJournal<E, I>,
     values: Glob<E, V>,
     tracking: Option<Tracking<E>>,
+    /// Lazily synced index entries when values are framed, `None` when both journals sync
+    /// together.
+    index_tail: Option<IndexTail>,
 }
 
 /// Owns both journals while initialization may still discard unreferenced data.
@@ -287,6 +367,7 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> From<Pending<E, I, V>>
     /// Publish both journals after paired recovery.
     fn from(recovery: Pending<E, I, V>) -> Self {
         Self {
+            index_tail: recovery.values.self_delimiting().then(IndexTail::default),
             index: recovery.index,
             values: recovery.values.into(),
             tracking: recovery.tracking,
@@ -351,6 +432,7 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Pending<E, I, V> {
             write_buffer: cfg.index_write_buffer,
         };
         let index_context = context.child("index");
+        let record_header = cfg.framed_values.then_some(I::SIZE);
         let value_cfg = GlobConfig {
             partition: cfg.value_partition,
             compression: cfg.compression,
@@ -362,14 +444,16 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Pending<E, I, V> {
         let (index, values) = match recovery {
             RecoveryMode::Infer { ceiling } => {
                 let index = FixedJournal::init_bounded(index_context, index_cfg, ceiling).await?;
-                let values = GlobRecovery::init(value_context, value_cfg, ceiling).await?;
+                let values =
+                    GlobRecovery::init(value_context, value_cfg, ceiling, record_header).await?;
                 (index, values)
             }
             RecoveryMode::Floors { floors, ceiling } => {
                 let preflight =
                     FixedJournal::preflight_floors(index_context, index_cfg, floors, ceiling)
                         .await?;
-                let values = GlobRecovery::init(value_context, value_cfg, ceiling).await?;
+                let values =
+                    GlobRecovery::init(value_context, value_cfg, ceiling, record_header).await?;
                 Self::validate_value_floors(&values, &preflight)?;
                 (preflight.finish().await?, values)
             }
@@ -380,7 +464,8 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Pending<E, I, V> {
                 let preflight =
                     FixedJournal::preflight_restore(index_context, index_cfg, section, index_size)
                         .await?;
-                let values = GlobRecovery::init(value_context, value_cfg, section).await?;
+                let values =
+                    GlobRecovery::init(value_context, value_cfg, section, record_header).await?;
                 let value_size = Self::validate_restore_values(&values, &preflight, section)?;
                 let index = preflight.finish().await?;
 
@@ -732,6 +817,76 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Pending<E, I, V> {
         Ok(self)
     }
 
+    /// Durably truncate each section at its first invalid position found by tracked replay.
+    async fn apply_truncations(mut self, truncations: Vec<(u64, u64)>) -> Result<Self, Error> {
+        let chunk_size = FixedJournal::<E, I>::CHUNK_SIZE as u64;
+        for (section, items) in truncations {
+            let index_size = items.checked_mul(chunk_size).ok_or(Error::OffsetOverflow)?;
+            self = self.truncate_pending_section(section, index_size).await?;
+        }
+        Ok(self)
+    }
+
+    /// Return the end of the last value `section`'s index references.
+    async fn indexed_value_end(&self, section: u64) -> Result<u64, Error> {
+        match self.index.last(section).await {
+            Ok(entry) => Self::boundary_value_end(section, &entry),
+            Err(Error::SectionOutOfRange(_)) => Ok(0),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Index every framed value record past the last indexed value of its section, returning the
+    /// appended `(section, position, entry)` in journal order.
+    ///
+    /// Each value section is durably truncated to its last accepted record before any rebuilt
+    /// entry is appended, and the appended index sections are synced before returning, so markers
+    /// may then cover them.
+    async fn rebuild_index(mut self) -> Result<(Self, Vec<(u64, u64, I)>), Error> {
+        let mut accepted = BTreeMap::new();
+        let mut value_truncations = BTreeMap::new();
+        let sections = self.values.sections().collect::<Vec<_>>();
+        for section in sections {
+            let start = self.indexed_value_end(section).await?;
+            let (records, _) = self.values.scan(section, start).await?;
+            let mut end = start;
+            let mut entries = Vec::new();
+            for (offset, size, header) in records {
+                let Ok(entry) = I::decode(bytes::Bytes::from(header)) else {
+                    break;
+                };
+                if entry.value_location() != (offset, size) {
+                    break;
+                }
+                end = offset + u64::from(size);
+                entries.push(entry);
+            }
+            if self.values.size(section)? > end {
+                debug!(section, end, "truncating unindexable value tail");
+                value_truncations.insert(section, end);
+            }
+            if !entries.is_empty() {
+                accepted.insert(section, entries);
+            }
+        }
+        self.values = self.values.truncate_sections(&value_truncations).await?;
+
+        let mut rebuilt = Vec::new();
+        for (&section, entries) in &accepted {
+            for entry in entries {
+                let position;
+                (self.index, position) = self.index.append(section, entry).await?;
+                rebuilt.push((section, position, entry.clone()));
+            }
+        }
+        if !accepted.is_empty() {
+            warn!(entries = rebuilt.len(), "rebuilt index entries from framed values");
+            let sections = accepted.keys().copied().collect::<Vec<_>>();
+            self.index = self.index.sync(&sections).await?;
+        }
+        Ok((self, rebuilt))
+    }
+
     /// Replay unpublished index sections without releasing recovery ownership.
     async fn replay(
         self,
@@ -741,15 +896,26 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Pending<E, I, V> {
     ) -> Result<Replay<E, I, V>, Error> {
         let index = self.index.replay(0, 0, buffer, read_options).await?;
         let phase = ReplayPhase::Tracked {
+            index,
             values: self.values,
             validation,
         };
         Ok(Replay {
-            index,
             phase,
             tracking: self.tracking,
+            index_tail: None,
         })
     }
+}
+
+/// Reject [Config::framed_values] for an initialization that cannot rebuild the index.
+fn require_unframed<C>(cfg: &Config<C>) -> Result<(), Error> {
+    if cfg.framed_values {
+        return Err(Error::InvalidConfiguration(
+            "framed values require tracked initialization".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl<E: Context, I: Record + Send + Sync, V: CodecShared> Oversized<E, I, V> {
@@ -764,6 +930,7 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Oversized<E, I, V> {
         section: u64,
         end: u64,
     ) -> Result<Self, Error> {
+        require_unframed(&cfg)?;
         // The index must release references before paired recovery can release value bytes.
         let end = end - end % FixedJournal::<E, I>::CHUNK_SIZE as u64;
         super::manager::truncate_paged_tail(
@@ -792,6 +959,7 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Oversized<E, I, V> {
     /// the glob, checksum-verified) and truncates the index journal to exclude the entries beyond
     /// it.
     pub async fn init(context: E, cfg: Config<V::Cfg>) -> Result<Self, Error> {
+        require_unframed(&cfg)?;
         let replay_buffer = cfg.replay_buffer;
         let journal =
             Pending::init(context, cfg, RecoveryMode::Infer { ceiling: u64::MAX }).await?;
@@ -815,6 +983,7 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Oversized<E, I, V> {
         cfg: Config<V::Cfg>,
         checkpoint: (u64, u64),
     ) -> Result<Self, Error> {
+        require_unframed(&cfg)?;
         let (section, index_size) = checkpoint;
         let journal = Pending::init(
             context,
@@ -983,7 +1152,18 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Oversized<E, I, V> {
         // Write value first (glob). This will typically write to an in-memory
         // buffer and return quickly (only blocks when the buffer is full).
         let (offset, size);
-        (self.values, offset, size) = self.values.append(section, value).await?;
+        (self.values, offset, size) = if let Some(tail) = &mut self.index_tail {
+            let appended = self
+                .values
+                .append_record(section, value, |offset, size, mut header| {
+                    entry.clone().with_location(offset, size).write(&mut header);
+                })
+                .await?;
+            tail.append(section, appended.2);
+            appended
+        } else {
+            self.values.append(section, value).await?
+        };
 
         // Update entry with actual location and write to index
         let entry_with_location = entry.with_location(offset, size);
@@ -1041,14 +1221,15 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Oversized<E, I, V> {
             index,
             values,
             tracking,
+            index_tail,
         } = self;
         let index = index
             .replay(start_section, start_position, buffer, read_options)
             .await?;
         Ok(Replay {
-            index,
-            phase: ReplayPhase::Live(values),
+            phase: ReplayPhase::Live { index, values },
             tracking,
+            index_tail,
         })
     }
 
@@ -1067,13 +1248,24 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Oversized<E, I, V> {
             .take()
             .expect("tracked sync preserves its recovery state");
         let marker_pending = tracking.observe_marker_sync()?;
-        let lengths = sections
+
+        // A framed journal syncs only the index sections its tail selects, together with their
+        // values. Marker barriers bind only to those joint syncs.
+        let (index_sections, value_sections) = match &mut self.index_tail {
+            Some(tail) => {
+                let index_sections = tail.take_checkpoint(active);
+                let value_sections = sections.union(&index_sections).copied().collect();
+                (index_sections, value_sections)
+            }
+            None => (sections.clone(), sections.clone()),
+        };
+        let lengths = index_sections
             .iter()
             .map(|&section| Ok((section, self.index.section_len(section)?)))
             .collect::<Result<Vec<_>, Error>>()?;
         let ((index, index_handle), (values, values_handle)) = try_join(
-            self.index.start_sync(sections),
-            self.values.start_sync(sections),
+            self.index.start_sync(&index_sections),
+            self.values.start_sync(&value_sections),
         )
         .await?;
         self.index = index;
@@ -1185,9 +1377,10 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Oversized<E, I, V> {
 
     /// Prune both journals. Returns true if any sections were pruned.
     ///
-    /// Prunes index first, then glob. This order ensures crash safety:
-    /// - If crash after index prune but before glob: orphan data in glob (acceptable)
-    /// - If crash before index prune: no change, retry works
+    /// Removes markers first. Without framed values it then prunes the index before the values,
+    /// so an interruption leaves only orphan values, which recovery removes. With framed values
+    /// it prunes the values first, so an interruption leaves only index entries without values,
+    /// which recovery truncates.
     pub async fn prune(mut self, min: u64) -> Result<(Self, bool), Error> {
         // Remove and durably sync tracked floors before their section names can be deleted and
         // later reused.
@@ -1206,10 +1399,16 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Oversized<E, I, V> {
             self.tracking = Some(tracking);
         }
 
-        let index_pruned;
-        (self.index, index_pruned) = self.index.prune(min).await?;
-        let value_pruned;
-        (self.values, value_pruned) = self.values.prune(min).await?;
+        // Framed values are authoritative, so they go before the index that caches them.
+        let (index_pruned, value_pruned);
+        if let Some(tail) = &mut self.index_tail {
+            tail.sections = tail.sections.split_off(&min);
+            (self.values, value_pruned) = self.values.prune(min).await?;
+            (self.index, index_pruned) = self.index.prune(min).await?;
+        } else {
+            (self.index, index_pruned) = self.index.prune(min).await?;
+            (self.values, value_pruned) = self.values.prune(min).await?;
+        }
         Ok((self, index_pruned || value_pruned))
     }
 
@@ -1271,22 +1470,35 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Oversized<E, I, V> {
 /// destroys the journal: recovery is re-initialization. Call [Replay::finish] on an exhausted
 /// reader to get the journal back.
 pub struct Replay<E: Context, I: Record, V: Codec> {
-    index: FixedReplay<E, I>,
-    /// Value ownership phase, with validation state only during tracked startup recovery.
-    phase: ReplayPhase<E, V>,
+    /// Index and value ownership phase, with validation state only during tracked startup
+    /// recovery.
+    phase: ReplayPhase<E, I, V>,
     tracking: Option<Tracking<E>>,
+    index_tail: Option<IndexTail>,
 }
 
 /// Retain the ownership phase while an index replay is in progress.
-enum ReplayPhase<E: Context, V: Codec> {
-    Live(Glob<E, V>),
+enum ReplayPhase<E: Context, I: Record, V: Codec> {
+    Live {
+        index: FixedReplay<E, I>,
+        values: Glob<E, V>,
+    },
     Tracked {
+        index: FixedReplay<E, I>,
         /// Value recovery owner used to validate entries at or above each durable floor until
         /// the first invalid value.
         values: GlobRecovery<E, V>,
         /// Cursor and deferred truncation state for the tracked startup replay.
         validation: Validation,
     },
+    /// Tracked recovery of framed values rebuilt index entries that the index had not persisted;
+    /// they are yielded after every replayed entry.
+    Rebuilt {
+        journal: Pending<E, I, V>,
+        entries: VecDeque<(u64, u64, I)>,
+    },
+    /// A rebuild failed and the journal is lost.
+    Failed,
 }
 
 impl<E: Context, I: Record + Send + Sync, V: CodecShared> Replay<E, I, V> {
@@ -1300,13 +1512,28 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Replay<E, I, V> {
     /// [Error::ReplayInterrupted], end the replay.
     pub async fn next(&mut self) -> Option<Result<(u64, u64, I), Error>> {
         loop {
-            let result = self.index.next().await?;
+            let (index, values, validation) = match &mut self.phase {
+                ReplayPhase::Live { index, .. } => return index.next().await,
+                ReplayPhase::Rebuilt { entries, .. } => return entries.pop_front().map(Ok),
+                ReplayPhase::Failed => return None,
+                ReplayPhase::Tracked {
+                    index,
+                    values,
+                    validation,
+                } => (index, values, validation),
+            };
+            let Some(result) = index.next().await else {
+                if !values.self_delimiting() || validation.failed {
+                    return None;
+                }
+                if let Err(err) = self.rebuild().await {
+                    return Some(Err(err));
+                }
+                continue;
+            };
             let (section, position, entry) = match result {
                 Ok(entry) => entry,
                 Err(err) => return Some(Err(err)),
-            };
-            let ReplayPhase::Tracked { values, validation } = &mut self.phase else {
-                return Some(Ok((section, position, entry)));
             };
 
             // Each section validates forward from its durable floor. Once one value fails, later
@@ -1345,44 +1572,77 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Replay<E, I, V> {
         }
     }
 
+    /// Release the exhausted index, drop entries ahead of their values, and index the framed
+    /// value records the index had not persisted.
+    async fn rebuild(&mut self) -> Result<(), Error> {
+        let ReplayPhase::Tracked {
+            index,
+            values,
+            validation,
+        } = std::mem::replace(&mut self.phase, ReplayPhase::Failed)
+        else {
+            unreachable!("only tracked replay rebuilds");
+        };
+        let journal = Pending {
+            index: index.finish()?,
+            values,
+            tracking: self.tracking.take(),
+        };
+        let (journal, entries) = journal
+            .apply_truncations(validation.truncations)
+            .await?
+            .rebuild_index()
+            .await?;
+        self.phase = ReplayPhase::Rebuilt {
+            journal,
+            entries: entries.into(),
+        };
+        Ok(())
+    }
+
     /// Returns the journal.
     ///
     /// Fails when the reader was not fully drained or yielded an error: the journal is
     /// destroyed and recovery is re-initialization.
     pub fn finish(self) -> Result<Oversized<E, I, V>, Error> {
-        let ReplayPhase::Live(values) = self.phase else {
+        let ReplayPhase::Live { index, values } = self.phase else {
             return Err(Error::ReplayFailed);
         };
         Ok(Oversized {
-            index: self.index.finish()?,
+            index: index.finish()?,
             values,
             tracking: self.tracking,
+            index_tail: self.index_tail,
         })
     }
 
     /// Finish marker-aware startup recovery and return the tracked journal.
     pub async fn finish_tracked(self) -> Result<Oversized<E, I, V>, Error> {
-        let ReplayPhase::Tracked { values, validation } = self.phase else {
-            return Err(Error::ReplayFailed);
-        };
-        if validation.failed {
-            return Err(Error::ReplayFailed);
-        }
-        let mut journal = Pending {
-            index: self.index.finish()?,
-            values,
-            tracking: self.tracking,
+        let journal = match self.phase {
+            ReplayPhase::Tracked {
+                index,
+                values,
+                validation,
+            } => {
+                if validation.failed {
+                    return Err(Error::ReplayFailed);
+                }
+
+                // Apply each section's first invalid position only after replay releases the
+                // index journal.
+                Pending {
+                    index: index.finish()?,
+                    values,
+                    tracking: self.tracking,
+                }
+                .apply_truncations(validation.truncations)
+                .await?
+            }
+            ReplayPhase::Rebuilt { journal, entries } if entries.is_empty() => journal,
+            _ => return Err(Error::ReplayFailed),
         };
 
-        // Apply each section's first invalid position only after replay releases the index
-        // journal, then publish the exact retained lengths as the next marker generation.
-        let chunk_size = FixedJournal::<E, I>::CHUNK_SIZE as u64;
-        for (section, items) in validation.truncations {
-            let index_size = items.checked_mul(chunk_size).ok_or(Error::OffsetOverflow)?;
-            journal = journal
-                .truncate_pending_section(section, index_size)
-                .await?;
-        }
+        // Publish the exact retained lengths as the next marker generation.
         Ok(journal
             .align_values_to_index()
             .await?
@@ -1424,6 +1684,7 @@ mod tests {
                 compression: value_cfg.compression,
                 codec_config: value_cfg.codec_config,
                 replay_buffer: commonware_utils::NZUsize!(65536),
+                framed_values: false,
             };
             _ = self.sync_all().await?;
             Self::init_at_most(context, cfg, section, end).await
@@ -1654,6 +1915,7 @@ mod tests {
             replay_buffer: NZUsize!(4096),
             compression: None,
             codec_config: (),
+            framed_values: false,
         }
     }
 
