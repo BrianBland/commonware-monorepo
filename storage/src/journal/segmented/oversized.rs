@@ -1251,14 +1251,14 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Oversized<E, I, V> {
 
         // A framed journal syncs only the index sections its tail selects, together with their
         // values. Marker barriers bind only to those joint syncs.
-        let (index_sections, value_sections) = match &mut self.index_tail {
-            Some(tail) => {
-                let index_sections = tail.take_checkpoint(active);
-                let value_sections = sections.union(&index_sections).copied().collect();
-                (index_sections, value_sections)
-            }
-            None => (sections.clone(), sections.clone()),
-        };
+        let index_sections = self
+            .index_tail
+            .as_mut()
+            .map_or_else(|| sections.clone(), |tail| tail.take_checkpoint(active));
+        let value_sections = sections
+            .union(&index_sections)
+            .copied()
+            .collect::<BTreeSet<_>>();
         let lengths = index_sections
             .iter()
             .map(|&section| Ok((section, self.index.section_len(section)?)))

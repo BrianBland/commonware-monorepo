@@ -21,12 +21,20 @@
 //! +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
 //! ```
 //!
-//! **Value Blob** - Raw values with CRC32 checksums (direct reads, no page cache):
+//! **Value Blob** - Self-delimiting records that carry their index entry, checksummed by a
+//! CRC32 over every preceding byte (direct reads, no page cache):
 //! ```text
-//! +---+---+---+---+---+---+---+---+---+---+---+---+
-//! |     Compressed Data (variable)    |   CRC32   |
-//! +---+---+---+---+---+---+---+---+---+---+---+---+
+//! +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+//! | Size(u32) | Index Entry (as above) | Compressed Data |   CRC32   |
+//! +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
 //! ```
+//!
+//! The value blob is the archive's write-ahead log and the index journal a lazily synced cache
+//! of it (see [crate::journal::segmented::oversized] "Framed Values"). A sync makes the written
+//! values durable; the index of a section is synced once the section stops being written or the
+//! unsynced index tail reaches its bound. Recovery rebuilds index entries missing after a crash
+//! from the value records. This format applies to fresh partitions only: a partition written
+//! with unframed values cannot be opened.
 //!
 //! # Uniqueness
 //!
