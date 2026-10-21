@@ -801,12 +801,6 @@ where
                 let commitment = finalization.proposal.payload;
                 let digest = V::commitment_to_inner(commitment);
 
-                // Cache finalization by round.
-                self.cache = self
-                    .cache
-                    .put_finalization(round, digest, &finalization)
-                    .await;
-
                 // Search for the finalized block locally, otherwise fetch it remotely.
                 if let Some(block) = self.find_block_by_commitment(buffer, commitment).await {
                     // The anchor path stores the floor block and finalization,
@@ -836,6 +830,15 @@ where
                         debug!(?round, %height, "finalized block stored");
                     }
                 } else {
+                    // Cache the finalization by digest until the block arrives. A
+                    // locally available block skips this write: its finalization is
+                    // stored by height above, and that archive is durable before the
+                    // block is dispatched.
+                    self.cache = self
+                        .cache
+                        .put_finalization(round, digest, &finalization)
+                        .await;
+
                     // The finalization carries a round and commitment, but not a
                     // height. Keep the request round-bound until the block is decoded.
                     debug!(?round, ?commitment, "finalized block missing");
