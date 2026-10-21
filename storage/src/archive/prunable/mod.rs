@@ -295,6 +295,11 @@ mod tests {
         + i32::SIZE
         + crate::journal::segmented::glob::CHECKSUM_SIZE) as u64;
 
+    /// Physical size of one uncompressed i32 value frame of an unframed archive (encoded value
+    /// followed by its CRC32).
+    const I32_UNFRAMED_VALUE_FRAME_SIZE: u64 =
+        (i32::SIZE + crate::journal::segmented::glob::CHECKSUM_SIZE) as u64;
+
     #[test_traced]
     fn test_put_after_start_sync_is_accepted_before_handle_completes() {
         let executor = deterministic::Runner::default();
@@ -366,7 +371,7 @@ mod tests {
                 pending: pending.clone(),
             };
             let cfg = test_config(&context, "test", NZU64!(DEFAULT_ITEMS_PER_SECTION), FourCap);
-            let archive = Archive::init(context.child("storage"), cfg)
+            let archive = Archive::init_unframed(context.child("storage"), cfg)
                 .await
                 .expect("Failed to initialize archive");
 
@@ -427,7 +432,7 @@ mod tests {
                 pending: pending.clone(),
             };
             let cfg = test_config(&context, "test", NZU64!(1), FourCap);
-            let archive = Archive::init(context.child("storage"), cfg)
+            let archive = Archive::init_unframed(context.child("storage"), cfg)
                 .await
                 .expect("Failed to initialize archive");
 
@@ -816,7 +821,7 @@ mod tests {
                 pending: pending.clone(),
             };
             let cfg = test_config(&context, "test", NZU64!(1), FourCap);
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(context.child("storage"), cfg)
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("storage"), cfg)
                 .await
                 .expect("Failed to initialize archive");
 
@@ -843,7 +848,7 @@ mod tests {
 
         deterministic::Runner::from(checkpoint).start(|context| async move {
             let cfg = test_config(&context, "test", NZU64!(1), FourCap);
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(context.child("reopen"), cfg)
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("reopen"), cfg)
                 .await
                 .expect("Failed to reopen archive");
 
@@ -862,7 +867,7 @@ mod tests {
                 pending: pending.clone(),
             };
             let cfg = test_config(&context, "test", NZU64!(1), FourCap);
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(context.child("storage"), cfg)
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("storage"), cfg)
                 .await
                 .expect("Failed to initialize archive");
 
@@ -885,7 +890,7 @@ mod tests {
 
         deterministic::Runner::from(checkpoint).start(|context| async move {
             let cfg = test_config(&context, "test", NZU64!(1), FourCap);
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(context.child("reopen"), cfg)
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("reopen"), cfg)
                 .await
                 .expect("Failed to reopen archive");
 
@@ -904,7 +909,7 @@ mod tests {
                 pending: pending.clone(),
             };
             let cfg = test_config(&context, "test", NZU64!(DEFAULT_ITEMS_PER_SECTION), FourCap);
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(context.child("storage"), cfg)
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("storage"), cfg)
                 .await
                 .expect("Failed to initialize archive");
 
@@ -1009,7 +1014,7 @@ mod tests {
 
             // Seed one durable value, then drop the sidecar so startup cannot consult markers
             // and must reconcile the journals alone.
-            let archive = Archive::init(context.child("seed"), cfg.clone())
+            let archive = Archive::init_unframed(context.child("seed"), cfg.clone())
                 .await
                 .unwrap();
             let archive = archive.put(0, test_key("zero"), &10).await.unwrap();
@@ -1034,10 +1039,10 @@ mod tests {
                 .open(&cfg.value_partition, &0u64.to_be_bytes())
                 .await
                 .unwrap();
-            assert_eq!(value_size, I32_VALUE_FRAME_SIZE);
+            assert_eq!(value_size, I32_UNFRAMED_VALUE_FRAME_SIZE);
 
             let archive =
-                Archive::<_, _, FixedBytes<64>, i32>::init(context.child("repair"), cfg.clone())
+                Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("repair"), cfg.clone())
                     .await
                     .unwrap();
             assert_eq!(archive.last_index(), None);
@@ -1066,7 +1071,7 @@ mod tests {
             let completed_clone = completed.clone();
             let cfg_clone = cfg.clone();
             let task = context.child("clean_restart_task").spawn(|_| async move {
-                let result = Archive::init(delayed.child("archive"), cfg_clone).await;
+                let result = Archive::init_unframed(delayed.child("archive"), cfg_clone).await;
                 completed_clone.store(1, Ordering::Relaxed);
                 result
             });
@@ -1090,9 +1095,9 @@ mod tests {
                 .open(&cfg.value_partition, &0u64.to_be_bytes())
                 .await
                 .unwrap();
-            assert_eq!(value_size, I32_VALUE_FRAME_SIZE);
+            assert_eq!(value_size, I32_UNFRAMED_VALUE_FRAME_SIZE);
 
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(context.child("reopen"), cfg)
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("reopen"), cfg)
                 .await
                 .unwrap();
             assert_eq!(archive.get(Identifier::Index(0)).await.unwrap(), Some(20));
@@ -1425,7 +1430,7 @@ mod tests {
         let executor = deterministic::Runner::default();
         let (_, checkpoint) = executor.start_and_recover(|context| async move {
             let cfg = test_config(&context, "marker-torn-tail", NZU64!(4), FourCap);
-            let archive = Archive::init(context.child("seed"), cfg.clone())
+            let archive = Archive::init_unframed(context.child("seed"), cfg.clone())
                 .await
                 .unwrap();
 
@@ -1524,7 +1529,7 @@ mod tests {
                 .open(&cfg.value_partition, &0u64.to_be_bytes())
                 .await
                 .unwrap();
-            assert_eq!(value_size, 2 * I32_VALUE_FRAME_SIZE);
+            assert_eq!(value_size, 2 * I32_UNFRAMED_VALUE_FRAME_SIZE);
         });
 
         deterministic::Runner::from(checkpoint).start(|context| async move {
@@ -1540,7 +1545,7 @@ mod tests {
             // durably remove only the orphaned value suffix.
             let archive = drive_pending_syncs(
                 &pending,
-                Archive::<_, _, FixedBytes<64>, i32>::init(delayed.child("reopen"), cfg.clone()),
+                Archive::<_, _, FixedBytes<64>, i32>::init_unframed(delayed.child("reopen"), cfg.clone()),
             )
             .await
             .unwrap();
@@ -1555,7 +1560,7 @@ mod tests {
                 .open(&cfg.value_partition, &0u64.to_be_bytes())
                 .await
                 .unwrap();
-            assert_eq!(value_size, I32_VALUE_FRAME_SIZE);
+            assert_eq!(value_size, I32_UNFRAMED_VALUE_FRAME_SIZE);
         });
     }
 
@@ -1566,7 +1571,7 @@ mod tests {
 
             // Seed one durable value with no published marker, so the next startup must
             // validate it and derive the marker itself.
-            let archive = Archive::init(context.child("seed"), cfg.clone())
+            let archive = Archive::init_unframed(context.child("seed"), cfg.clone())
                 .await
                 .unwrap();
             let archive = archive.put(0, test_key("zero"), &10).await.unwrap();
@@ -1586,7 +1591,7 @@ mod tests {
             let reopen_cfg = cfg.clone();
             let task = context.child("startup").spawn(|_| async move {
                 let result =
-                    Archive::<_, _, FixedBytes<64>, i32>::init(delayed.child("reopen"), reopen_cfg)
+                    Archive::<_, _, FixedBytes<64>, i32>::init_unframed(delayed.child("reopen"), reopen_cfg)
                         .await;
                 completed_clone.store(1, Ordering::Relaxed);
                 result
@@ -1616,7 +1621,7 @@ mod tests {
             drop(archive);
 
             // The published marker must leave a reopenable archive.
-            Archive::<_, _, FixedBytes<64>, i32>::init(context.child("marker_reopen"), cfg)
+            Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("marker_reopen"), cfg)
                 .await
                 .unwrap()
                 .destroy()
@@ -1631,7 +1636,7 @@ mod tests {
             let cfg = test_config(&context, "startup-marker-failure", NZU64!(4), FourCap);
 
             // Seed one durable value with no published marker, so reopen must derive one.
-            let archive = Archive::init(context.child("seed"), cfg.clone())
+            let archive = Archive::init_unframed(context.child("seed"), cfg.clone())
                 .await
                 .unwrap();
             let archive = archive.put(0, test_key("zero"), &10).await.unwrap();
@@ -1646,7 +1651,7 @@ mod tests {
                 pending: pending.clone(),
             };
             pending.arm();
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(delayed.child("reopen"), cfg)
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(delayed.child("reopen"), cfg)
                 .await
                 .unwrap();
             assert_eq!(pending.lock().len(), 1);
@@ -1669,7 +1674,7 @@ mod tests {
                 inner: context.child("delayed"),
                 pending: pending.clone(),
             };
-            let archive = Archive::init(delayed.child("archive"), cfg.clone())
+            let archive = Archive::init_unframed(delayed.child("archive"), cfg.clone())
                 .await
                 .unwrap();
 
@@ -1696,7 +1701,7 @@ mod tests {
 
             // Reopen adopts section 0 through its published marker and validates section 4
             // above its absent one. Both items must survive.
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(
                 context.child("first_reopen"),
                 cfg.clone(),
             )
@@ -1705,7 +1710,7 @@ mod tests {
             assert_eq!(archive.ranges().collect::<Vec<_>>(), vec![(0, 0), (4, 4)]);
             drop(archive);
 
-            Archive::<_, _, FixedBytes<64>, i32>::init(context.child("second_reopen"), cfg)
+            Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("second_reopen"), cfg)
                 .await
                 .unwrap()
                 .destroy()
@@ -1725,7 +1730,7 @@ mod tests {
                 inner: context.child("delayed"),
                 pending: pending.clone(),
             };
-            let archive = Archive::init(delayed.child("archive"), cfg.clone())
+            let archive = Archive::init_unframed(delayed.child("archive"), cfg.clone())
                 .await
                 .unwrap();
 
@@ -1790,7 +1795,7 @@ mod tests {
 
             // Both items survive reopen: the published marker adopts section 0 and validation
             // covers section 4.
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(
                 delayed.inner.child("first_reopen"),
                 cfg.clone(),
             )
@@ -1800,7 +1805,7 @@ mod tests {
             assert_eq!(archive.get(Identifier::Index(4)).await.unwrap(), Some(40));
             drop(archive);
 
-            Archive::<_, _, FixedBytes<64>, i32>::init(delayed.inner.child("second_reopen"), cfg)
+            Archive::<_, _, FixedBytes<64>, i32>::init_unframed(delayed.inner.child("second_reopen"), cfg)
                 .await
                 .unwrap()
                 .destroy()
@@ -1822,7 +1827,7 @@ mod tests {
             };
             let cfg = test_config(&immediate, "ready-marker-lag", NZU64!(4), FourCap);
 
-            let archive = Archive::init(immediate.child("archive"), cfg)
+            let archive = Archive::init_unframed(immediate.child("archive"), cfg)
                 .await
                 .unwrap();
             let initial_starts = pending.starts();
@@ -1855,7 +1860,7 @@ mod tests {
                 pending: pending.clone(),
             };
             let cfg = test_config(&immediate, "section-marker-batch", NZU64!(4), FourCap);
-            let archive = Archive::init(immediate.child("archive"), cfg)
+            let archive = Archive::init_unframed(immediate.child("archive"), cfg)
                 .await
                 .unwrap();
             let initial_starts = pending.starts();
@@ -1890,7 +1895,7 @@ mod tests {
                 inner: context.child("delayed"),
                 pending: pending.clone(),
             };
-            let archive = Archive::init(delayed.child("archive"), cfg.clone())
+            let archive = Archive::init_unframed(delayed.child("archive"), cfg.clone())
                 .await
                 .unwrap();
 
@@ -1934,7 +1939,7 @@ mod tests {
             // debt and a reopen sees all three sections.
             let archive = drive_pending_syncs(&pending, archive.sync()).await.unwrap();
             drop(archive);
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(context.child("reopen"), cfg)
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("reopen"), cfg)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2013,7 +2018,7 @@ mod tests {
                 inner: context.child("delayed"),
                 pending: pending.clone(),
             };
-            let archive = Archive::init(delayed.child("archive"), cfg.clone())
+            let archive = Archive::init_unframed(delayed.child("archive"), cfg.clone())
                 .await
                 .unwrap();
 
@@ -2036,7 +2041,7 @@ mod tests {
             assert_eq!(pending.starts(), 3);
             drop(archive);
 
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(context.child("reopen"), cfg)
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("reopen"), cfg)
                 .await
                 .unwrap();
             assert_eq!(archive.get(Identifier::Index(0)).await.unwrap(), Some(10));
@@ -2054,7 +2059,7 @@ mod tests {
                 inner: context.child("delayed"),
                 pending: pending.clone(),
             };
-            let archive = Archive::init(delayed.child("archive"), cfg.clone())
+            let archive = Archive::init_unframed(delayed.child("archive"), cfg.clone())
                 .await
                 .unwrap();
 
@@ -2083,7 +2088,7 @@ mod tests {
 
             // The recreated barrier's final marker covers section 0's full two-item prefix, so
             // a reopen sees every value.
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(context.child("reopen"), cfg)
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("reopen"), cfg)
                 .await
                 .unwrap();
             assert_eq!(archive.get(Identifier::Index(0)).await.unwrap(), Some(10));
@@ -2102,7 +2107,7 @@ mod tests {
             // prune the section away. Prune must remove the durable marker along with the data:
             // a surviving marker would make the next init fail by claiming a marked section
             // with no journals.
-            let archive = Archive::init(context.child("seed"), cfg.clone())
+            let archive = Archive::init_unframed(context.child("seed"), cfg.clone())
                 .await
                 .unwrap();
             let archive = archive.put_sync(0, test_key("old"), &10).await.unwrap();
@@ -2123,7 +2128,7 @@ mod tests {
                 inner: context.child("delayed"),
                 pending: pending.clone(),
             };
-            let archive = Archive::init(delayed.child("reuse"), cfg.clone())
+            let archive = Archive::init_unframed(delayed.child("reuse"), cfg.clone())
                 .await
                 .unwrap();
             let archive = archive.put(0, test_key("new"), &20).await.unwrap();
@@ -2133,7 +2138,7 @@ mod tests {
             handle.await.unwrap();
             drop(archive);
 
-            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(context.child("reopen"), cfg)
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init_unframed(context.child("reopen"), cfg)
                 .await
                 .unwrap();
             assert_eq!(archive.get(Identifier::Index(0)).await.unwrap(), Some(20));
@@ -3408,6 +3413,53 @@ mod tests {
                 .unwrap();
             assert_items(&archive, 0..4, 2..4).await;
             archive.destroy().await.unwrap();
+        });
+    }
+
+    #[test_traced]
+    fn test_framed_start_sync_handle_waits_only_for_values() {
+        let (_, checkpoint) =
+            deterministic::Runner::default().start_and_recover(|context| async move {
+                let pending = PendingSyncs::default();
+                let context = DelayedSyncContext {
+                    inner: context,
+                    pending: pending.clone(),
+                };
+                let cfg = test_config(&context, "handles", NZU64!(1), FourCap);
+                let archive =
+                    Archive::<_, _, FixedBytes<64>, i32>::init(context.child("storage"), cfg)
+                        .await
+                        .unwrap();
+
+                // The active section syncs only its values.
+                let (archive, first) = archive
+                    .put_start_sync(1, test_key("aaa"), &10)
+                    .await
+                    .unwrap();
+                assert_eq!(pending.lock().len(), 1);
+
+                // Section 1 is no longer active, so its index is synced (with its in-flight
+                // values) alongside section 2's values.
+                let (archive, second) = archive
+                    .put_start_sync(2, test_key("bbb"), &20)
+                    .await
+                    .unwrap();
+                assert_eq!(pending.lock().len(), 3);
+
+                // Completing only section 1's value sync resolves its handle.
+                release_next_pending_syncs(&pending, 1);
+                first.await.unwrap();
+                drop(second);
+                drop(archive);
+            });
+
+        deterministic::Runner::from(checkpoint).start(|context| async move {
+            let cfg = test_config(&context, "handles", NZU64!(1), FourCap);
+            let archive = Archive::<_, _, FixedBytes<64>, i32>::init(context.child("reopen"), cfg)
+                .await
+                .unwrap();
+            assert_eq!(archive.get(Identifier::Index(1)).await.unwrap(), Some(10));
+            assert_eq!(archive.get(Identifier::Index(2)).await.unwrap(), None);
         });
     }
 

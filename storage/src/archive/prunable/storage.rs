@@ -369,7 +369,11 @@ impl<T: Translator, E: Context, K: Array, V: CodecShared> Inner<T, E, K, V> {
     }
 
     /// See [Archive::init].
-    async fn init(context: E, cfg: Config<T, V::Cfg>) -> Result<Self, Error> {
+    async fn init(
+        context: E,
+        cfg: Config<T, V::Cfg>,
+        framed_values: bool,
+    ) -> Result<Self, Error> {
         let items_per_section = cfg.items_per_section.get();
         let oversized_cfg = OversizedConfig {
             index_partition: cfg.key_partition,
@@ -380,7 +384,7 @@ impl<T: Translator, E: Context, K: Array, V: CodecShared> Inner<T, E, K, V> {
             replay_buffer: cfg.replay_buffer,
             compression: cfg.compression,
             codec_config: cfg.codec_config,
-            framed_values: true,
+            framed_values,
         };
         let mut replay = Oversized::<E, Record<K>, V>::init_with_metadata(
             context.child("oversized"),
@@ -801,7 +805,14 @@ impl<T: Translator, E: Context, K: Array, V: CodecShared> Archive<T, E, K, V> {
     /// Replays the index journal to rebuild the in-memory index, CRC-validating every value
     /// above its section's durable marker.
     pub async fn init(context: E, cfg: Config<T, V::Cfg>) -> Result<Self, Error> {
-        Ok(Self(Box::new(Inner::init(context, cfg).await?)))
+        Ok(Self(Box::new(Inner::init(context, cfg, true).await?)))
+    }
+
+    /// Initialize an `Archive` whose values are not framed, so every sync persists the index
+    /// together with its values.
+    #[cfg(test)]
+    pub(super) async fn init_unframed(context: E, cfg: Config<T, V::Cfg>) -> Result<Self, Error> {
+        Ok(Self(Box::new(Inner::init(context, cfg, false).await?)))
     }
 
     /// Prune `Archive` to the provided `min` (masked by the configured
